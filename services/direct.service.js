@@ -67,11 +67,12 @@ async function createSearchForm(req) {
   const $ = cheerio.load(htmlString);
 
  // Create a DOM environment
-    const dom = new JSDOM(html, { runScripts: 'dangerously' });
+    const dom = new JSDOM(htmlString, { runScripts: 'dangerously' });
 
     // Access the window object of the DOM
     const window = dom.window;
-
+    const modifiedHTML = window.document.documentElement.outerHTML;
+    console.log(modifiedHTML);
   const inputTag = $('input[name="__RequestVerificationToken"][type="hidden"]');
   const viewModelContent = htmlString.match(/var viewModel = (\{.*\});/)[1];
   const headerRequestVerificationToken = inputTag.attr("value");
