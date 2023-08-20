@@ -5,7 +5,6 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const routers = require('./controller');
 const redisClient = require('./config/redisClient');
-const crawl = require('./job/crawl');
 const logger = require('./utils/logger');
 
 //Setup
