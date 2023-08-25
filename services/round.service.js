@@ -1,468 +1,572 @@
-const redisService = require('../services/redis.service');
-const Flight = require('../model/response/flight.dto.js');
-const Response = require('../model/response/response.dto.js');
-const common = require('../utils/common');
-const logger    = require('../utils/logger');
-const qs = require('qs');
-
-exports.process =  async (req, res) => {
-    const flightInfo =  await getRoundwayFareFlight(req);
-    return res.status(200).json(flightInfo);
-}
-async function getRoundwayFareFlight(req){
-    const cookieIndex = await redisService.getCookieIndex();
-    if(cookieIndex === -1){
-        return Response.SERVER_MAINTAINING;
-    }
-    const searchForm = await createSearchForm(req, cookieIndex);
-    if (searchForm === undefined) {
-        return Response.SOLD_OUT;
-    } else {
-        return await getFlightInfo(req, searchForm, cookieIndex);
-    }
-}
-async function generatePassenger(json, type, startIndex, endIndex) {
-    const key = type === 'INFANT' ? "HAS_INFANT" : "TRAVELLER_TYPE";
-    for (let i = startIndex; i <= endIndex; i++) {
-        json[`${key}_${i}`] = type === 'INFANT' ? "TRUE" : type;
-    }
-    return json;
-}
-async function createSearchForm(req, cookieIndex) {
-    let cookie = await redisService.getCookieByIndex(cookieIndex);
-    if (cookie === undefined) {
-        await redisService.pushCookieExpired(cookieIndex);
-        return await getRoundwayFareFlight(req);
-    }
-    const body = req.body;
-    const dptDate = common.formatDate(body.dptDate, 'YYYY-MM-DD', 'YYYYMMDD0000');
-    const rtnDate = common.formatDate(body.rtnDate, 'YYYY-MM-DD', 'YYYYMMDD0000');
-    let initData = {
-    "COUNTRY_SITE": "VN",
-    "LANGUAGE": "GB",
-    "DATE_RANGE_QUALIFIER_2": "C",
-    "DATE_RANGE_QUALIFIER_1": "C",
-    "CABIN": "PE",
-    "MRCVA": "7.9",
-    "APPV": "7.9",
-    "E_LOCATION_1": body.dest,
-    "E_LOCATION_2": body.origin,
-    "CABIN_CLASS": "PE",
-    "TRIP_TYPE": "R",
-    "DATE_RANGE_VALUE_1": "3",
-    "DATE_RANGE_VALUE_2": "3",
-    "B_DATE_2": rtnDate,
-    "B_LOCATION_2": body.dest,
-    "B_LOCATION_1": body.origin,
-    "B_DATE_1": dptDate
+const Flight = require("../model/response/flight.dto.js");
+const Response = require("../model/response/response.dto.js");
+const common = require("../utils/common");
+const logger = require("../utils/logger");
+const qs = require("qs");
+const constant = require("../constants/constants");
+const cheerio = require("cheerio");
+const jsdom = require("jsdom");
+const he = require("he");
+exports.process = async (req, res) => {
+  const flightInfo = await getRoundwayFareFlight(req);
+  return res.status(200).json(flightInfo);
 };
-    let generateADT = await generatePassenger(initData, "ADT", 1, body.adult);
-    let generateCHD = await generatePassenger(generateADT, "CHD", body.adult+1, body.child+body.adult);
-    let generateINF = await generatePassenger(generateCHD, "INFANT", 1, body.infant > body.adult ? body.adult : body.infant);
-    const finalData= generateINF;
-    let config = {
-        method: 'post',
-        maxBodyLength: Infinity,
-        url: 'https://www.thaiairways.com/AIP_ENCTRIPNEW1/tripFlowIEncrypt',
-        headers: {
-            'Host': 'www.thaiairways.com',
-            'accept': '*/*',
-            'channel': 'MRCVI',
-            'content-type': 'application/json',
-            'x-d-token': '3:Gs6tBA7XtRdt7e3engEjBQ==:etlFbs4uCrKyQyuqJ5Jm70KE7+9C8Yso4o7Ki32xn5oFHXRknsHrvwq41PNXYaGMxqPKDK+UFo6oUxLFzb2sg9dqgCrNR+2/bLOU7zk6VUqKS7+mqbr+GlBL+Nh4dgVVIgjFLJ67oXWrfDBdcomY86QBVCmvDGc0gS9J3/zT8YzUSqAccvtQ+vpgY0iwmZQV3qXTLxx99qcJLqgDOclKmL9wwvwnFp5JCb3EIxh6ZaGfVGE90wsbCIoxTUo3M7V7+UcVK9JHUDzTcr1qEg8HyjIXcY013VjvtSXATkz8orBD0uqoyixSbVNFRylEqF/FwT+geem32HBPSBRqCEx65OWVGV0wwmc/+Ge997HcW6wVYOrYC6YrEPTwaFFWw6jqfF5CBSTCKLtEKI1ps3m7+mfNIP85W++nUMTCKZUiXIhEpWGGHfQSdtpjyICAs9p1w6BUj6+ueLpszdLLUG71dg==:YsUPPeCz1pIXFJBx7+TaGBAYdvctt6TJtXS+KyJ8tak=.Y-oX5VOZGNIKqEZK',
-            'user-agent': 'MDesApp/7.6 (com.thaiairways.mobile; build:9.0; iOS 16.5.1) Alamofire/7.6',
-            'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
-            'Cookie': cookie
-        },
-        data: finalData
-    };
-    const searchResponse = await common.fetchData(config);
-    if (searchResponse.data.toString().includes('Incapsula')) {
-        logger.warning(`Cookie ${cookieIndex} expried`);
-        await redisService.pushCookieExpired(cookieIndex);
-        return await getRoundwayFareFlight(req);
-    }
-    return searchResponse.data.params;
+async function getRoundwayFareFlight(req) {
+  return await createSearchForm(req);
 }
-async function getFlightInfo(req, searchForm, cookieIndex) {
-    const dptMap = new Map();
-    const rtnMap = new Map();
-    const dpt = new Array();
-    const rtn = new Array();
-    let cookie = await redisService.getCookieByIndex(cookieIndex);
-    if (cookie !== undefined && cookie !== null) {
-        logger.info(`Has cookie ${cookieIndex}`)
-    } else {
-        logger.warning(`Has no cookie index ${cookieIndex}`)
-        await redisService.pushCookieExpired(cookieIndex);
-        return await getRoundwayFareFlight(req);
-    }
-    const data = `ENC=${searchForm.ENC}&SITE=${searchForm.SITE}&SO_SITE_ENABLE_ERR_REDIRECT=FALSE&LANGUAGE=${searchForm.LANGUAGE}&MRCVI=7.6&ENCT=${searchForm.ENCT}&EMBEDDED_TRANSACTION=${searchForm.EMBEDDED_TRANSACTION}`;
-    let config = {
-        method: 'post',
-        maxBodyLength: Infinity,
-        url: 'https://book.thaiairways.com/plnext/tgpnextDX/Override.action',
-        headers: {
-            'Host': 'book.thaiairways.com',
-            'Cookie': cookie,
-            'content-type': 'application/x-www-form-urlencoded',
-            'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'channel': 'MRCVI',
-            'sec-fetch-site': 'none',
-            'x-d-token': '3:Gs6tBA7XtRdt7e3engEjBQ==:etlFbs4uCrKyQyuqJ5Jm70KE7+9C8Yso4o7Ki32xn5oFHXRknsHrvwq41PNXYaGMxqPKDK+UFo6oUxLFzb2sg9dqgCrNR+2/bLOU7zk6VUqKS7+mqbr+GlBL+Nh4dgVVIgjFLJ67oXWrfDBdcomY86QBVCmvDGc0gS9J3/zT8YzUSqAccvtQ+vpgY0iwmZQV3qXTLxx99qcJLqgDOclKmL9wwvwnFp5JCb3EIxh6ZaGfVGE90wsbCIoxTUo3M7V7+UcVK9JHUDzTcr1qEg8HyjIXcY013VjvtSXATkz8orBD0uqoyixSbVNFRylEqF/FwT+geem32HBPSBRqCEx65OWVGV0wwmc/+Ge997HcW6wVYOrYC6YrEPTwaFFWw6jqfF5CBSTCKLtEKI1ps3m7+mfNIP85W++nUMTCKZUiXIhEpWGGHfQSdtpjyICAs9p1w6BUj6+ueLpszdLLUG71dg==:YsUPPeCz1pIXFJBx7+TaGBAYdvctt6TJtXS+KyJ8tak=.300xsZk14eGnWi7p',
-            'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
-            'sec-fetch-mode': 'navigate',
-            'origin': 'null',
-            'user-agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148',
-            'sec-fetch-dest': 'document'
-        },
-        data: data
-    };
-    const searchResponse = await common.fetchData(config);
-    if (searchResponse.data === null || searchResponse.data === undefined) {
-        await redisService.pushCookieExpired(cookieIndex);
-        return await getRoundwayFareFlight(req);
-    }
-    const pattern = /{"siteConfiguration"\s*:\s*{[^]*}}}/g;
-    const cleanedData = searchResponse.data.replace(/\r?\n|\r/g, '');
-    const matches = cleanedData.match(pattern);
-    const jsonObject = JSON.parse(matches);
-    if (jsonObject === null) {
-        logger.warning(`Cookie ${cookieIndex} expried`);
-        await redisService.pushCookieExpired(cookieIndex);
-        return await getRoundwayFareFlight(req);
-    }
-    const setCookieHeader = searchResponse.headers['set-cookie'];
-    const umJstCookie = setCookieHeader.find(cookie => cookie.includes('um_jst'));
-    if(umJstCookie !== undefined){
-        const umJstValue = /um_jst=([^;]+)/.exec(umJstCookie)[1];
-        cookie = `um_jst=${umJstValue};${cookie};`;
-    }
-    const bigIpServerCookie = setCookieHeader.find(cookie => cookie.includes('BIGipServer~ETV~RD1_ns_bibi-prd_praxis_80_pool'));
-    const bigIpServerValue = /BIGipServer~ETV~RD1_ns_bibi-prd_praxis_80_pool=([^;]+)/.exec(bigIpServerCookie)[1];
-    cookie=`${cookie}BIGipServer~ETV~RD1_ns_bibi-prd_praxis_80_pool=${bigIpServerValue};`;
-    let availability = jsonObject.pageDefinitionConfig.pageData.business.Availability;
-    if (availability === undefined) {
-        const baseFacts = jsonObject.pageDefinitionConfig.pageData.basefacts;
-        const body = req.body;
-        let initData = {
-            'DATE_RANGE_QUALIFIER_2': baseFacts['request.DATE_RANGE_QUALIFIER_2'],
-            'COUNTRY_SITE': baseFacts['request.COUNTRY_SITE'],
-            'INITIAL_TRIP_TYPE': 'O',
-            'DATE_RANGE_QUALIFIER_1': baseFacts['request.DATE_RANGE_QUALIFIER_1'],
-            'EXTERNAL_ID#9': baseFacts['request.EXTERNAL_ID#9'],
-            'B_ANY_TIME_1': baseFacts['request.B_ANY_TIME_1'],
-            'search': '',
-            'TRIP_FLOW': baseFacts['request.TRIP_FLOW'],
-            'EXTERNAL_ID': baseFacts['request.EXTERNAL_ID'],
-            'TYPE': baseFacts['request.TYPE'],
-            'LANGUAGE': baseFacts['request.LANGUAGE'],
-            'ARRANGE_BY': baseFacts['request.ARRANGE_BY'],
-            'COMMERCIAL_FARE_FAMILY_1': baseFacts['request.COMMERCIAL_FARE_FAMILY_1'],
-            'SITE': baseFacts['request.SITE'],
-            'PAYMENT_TYPE': baseFacts['request.PAYMENT_TYPE'],
-            'E_LOCATION_1': baseFacts['request.E_LOCATION_1'],
-            'TRIP_TYPE': baseFacts['request.TRIP_TYPE'],
-            'OFFICE_ID': baseFacts['request.OFFICE_ID'],
-            'DATE_RANGE_VALUE_1': 0,
-            'ENCT': baseFacts['request.ENCT'],
-            'DATE_RANGE_VALUE_2': 0,
-            'SESSION_ID': baseFacts['request.SESSION_ID'],
-            'B_LOCATION_1': baseFacts['request.B_LOCATION_1'],
-            'B_DATE_1': baseFacts['request.B_DATE_1'],
-            'B_ANY_TIME_2': baseFacts['request.B_ANY_TIME_2'],
-            'PRICING_TYPE': 'O',
-            'PLTG_IS_UPSELL': 'true',
-            'DISPLAY_TYPE': baseFacts['request.DISPLAY_TYPE'],
-            'FORCE_CALENDAR': 'FALSE',
-            'PAGE_TICKET': '0',
-            'B_LOCATION_2': baseFacts['request.B_LOCATION_2'],
-            'E_LOCATION_2': baseFacts['request.E_LOCATION_2'],
-            'B_DATE_2': baseFacts['request.B_DATE_2'],
-            'BOOKING_FLOW': ''
-        };
-        let generateADT = await generatePassenger(initData, "ADT", 1, body.adult);
-        let generateCHD = await generatePassenger(generateADT, "CHD", body.adult + 1, body.child + body.adult);
-        let generateINF = await generatePassenger(generateCHD, "INFANT", 1, body.infant > body.adult ? body.adult : body.infant);
-        const finalData = qs.stringify(generateINF);
-        const jsessionidCookie = setCookieHeader.find(cookie => cookie.includes('JSESSIONID'));
-        const jsessionidValue = /JSESSIONID=([^;]+)/.exec(jsessionidCookie)[1];
-        let reConfig = {
-            method: 'post',
-            maxBodyLength: Infinity,
-            url: `https://book.thaiairways.com/plnext/tgpnextDX/FlexPricerAvailabilityDispatcherPui.action;jsessionid=${jsessionidValue.split('.')[0]}?X-Accept-Charset=iso-8859-1`,
-            headers: {
-                'authority': 'book.thaiairways.com',
-                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-                'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
-                'cache-control': 'max-age=0',
-                'content-type': 'application/x-www-form-urlencoded',
-                'cookie': cookie,
-                'origin': 'https://book.thaiairways.com',
-                'referer': 'https://book.thaiairways.com/plnext/tgpnextDX/Override.action',
-                'upgrade-insecure-requests': '1',
-                'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
-            },
-            data: finalData
-        };
-        const reSearch = await common.fetchData(reConfig);
-        if (reSearch.data === null || reSearch.data === undefined) {
-            await redisService.pushCookieExpired(cookieIndex);
-            return getOnewayFareFlight(req);
-        }
-        const reCleanedData = reSearch.data.replace(/\r?\n|\r/g, '');
-        const reMatches = reCleanedData.match(pattern);
-        const reJsonObject = JSON.parse(reMatches);
-        if (reJsonObject === null) {
-            logger.warning(`Cookie ${cookieIndex} expried`);
-            await redisService.pushCookieExpired(cookieIndex);
-            return getOnewayFareFlight(req);
-        }
-        availability = reJsonObject.pageDefinitionConfig.pageData.business.Availability;
-    }
-    if (availability === undefined) {
-        logger.warning(`No availability flights ${cookieIndex}`)
-        return Response.SOLD_OUT;
-    }
-    const recommendationList = availability.recommendationList;
-    const proposedBounds = availability.proposedBounds;
-    const dptFlights = proposedBounds[0].proposedFlightsGroup
-    const rtnFlights = proposedBounds[1].proposedFlightsGroup
-    for (flightIndex in dptFlights) {
-        const flightObject = new Flight();
-        const recomendList = recommendationList.filter(recommendation => recommendation.bounds[0].flightGroupList.find(flight => flight.flightId === dptFlights[flightIndex].proposedBoundId))
-        const recomend = recomendList.reduce((smallestObj, currentObj) => {
-            if (!smallestObj || currentObj.bounds[0].travellerPrices.ADT < smallestObj.bounds[0].travellerPrices.ADT) {
-              return currentObj;
-            }
-            return smallestObj;
-          }, null);
-        const dptSegments = dptFlights[flightIndex].segments;
-        if(dptSegments.length>2) continue;
-        const flight = recomend.bounds[0].flightGroupList.find(flight => flight.flightId === dptFlights[flightIndex].proposedBoundId);
-        const fareFamily= availability.fareFamilyList.find(fare => fare.ffCode === recomend.ffCode)
-        if(flight === undefined || flight ===null) continue;
-        // logger.info(bookingClass)
-        const dptTravellerPrices = {
-            ADT: recomend.bounds[0].travellerPrices.ADT,
-            CHD: recomend.bounds[0].travellerPrices.CHD,
-            INF: recomend.bounds[0].travellerPrices.INF
-        }
-        let dptDepartDateTime = null;
-            let dptArrivalDateTime = null;
-            let dptTransitDepartDateTime = null;
-            let dptTransitArrivalDateTime = null;
-            let dptDepartTerminal = null;
-            let dptArrivalTerminal = null;
-            let dptTransitDepartTerminal = null;
-            let dptTransitArrivalTerminal = null;
-        if (dptSegments.length == 2) {
-            dptDepartDateTime = common.formatFlightDate(dptSegments[0].beginDate);
-            dptArrivalDateTime = common.formatFlightDate(dptSegments[1].endDate);
-            dptTransitDepartDateTime = common.formatFlightDate(dptSegments[1].beginDate);
-            dptTransitArrivalDateTime = common.formatFlightDate(dptSegments[0].endDate);
-            dptDepartTerminal = dptSegments[0].beginTerminal;
-            dptArrivalTerminal = dptSegments[1].endTerminal;
-            dptTransitDepartTerminal = dptSegments[1].beginTerminal;
-            dptTransitArrivalTerminal = dptSegments[0].endTerminal;
-        }
-        if (dptSegments.length < 2) {
-            const segment = dptSegments[0];
-            flightObject.flightCode = segment.airline.code + segment.flightNumber;
-            flightObject.type = 'direct'
-            flightObject.departTerminal = segment.beginTerminal;
-            flightObject.departDateTime = common.formatFlightDate(segment.beginDate);
-            flightObject.arrivalTerminal = segment.endTerminal;
-            flightObject.arrivalDateTime = common.formatFlightDate(segment.endDate);
-            flightObject.cabinClass = fareFamily.ffName.replace('<br>', ' ');
-            flightObject.bookingClass = flight.rbd;
-            flightObject.class = flight.rbd;
-            flightObject.currency = availability.currencyBean.code;
-            flightObject.aircraftName = segment.equipment.name;
-            flightObject.aircraftIata = segment.equipment.code;
-            let match = segment.equipment.name.match(/ [^]*-/g)
-            if (match !== null) {
-                flightObject.aircraftIcao = match[0].slice(1, -1);
-            } else {
-                match = segment.equipment.name.match(/ [^]*/g);
-                if (match !== null) {
-                    flightObject.aircraftIcao = match[0].slice(1);
-                }
-            }
-            flightObject.operatingAirline = segment.opAirline.name
-            flightObject.priceAdult = (dptTravellerPrices.ADT === undefined) ? 0 : dptTravellerPrices.ADT;
-            flightObject.priceChild = (dptTravellerPrices.CHD === undefined) ? 0 : dptTravellerPrices.CHD;
-            flightObject.priceInfant = (dptTravellerPrices.INF === undefined) ? 0 : dptTravellerPrices.INF;
-        }else{
-            dptSegments.forEach(segment => {
-                if (segment.endLocation.locationCode !== req.body.dest) {
-                    flightObject.flightCode = segment.airline.code + segment.flightNumber;
-                    flightObject.type = 'direct'
-                    flightObject.departTerminal = segment.beginTerminal;
-                    flightObject.departDateTime = common.formatFlightDate(segment.beginDate);
-                    flightObject.arrivalTerminal = segment.endTerminal;
-                    flightObject.arrivalDateTime = common.formatFlightDate(segment.endDate);
-                    flightObject.cabinClass = fareFamily.ffName.replace('<br>', ' ');
-                    flightObject.bookingClass = flight.rbd;
-                    flightObject.class = flight.rbd;
-                    flightObject.currency = availability.currencyBean.code;
-                    flightObject.aircraftName = segment.equipment.name;
-                    flightObject.aircraftIata = segment.equipment.code;
-                    let match = segment.equipment.name.match(/ [^]*-/g)
-                    if (match !== null) {
-                        flightObject.aircraftIcao = match[0].slice(1, -1);
-                    } else {
-                        match = segment.equipment.name.match(/ [^]*/g);
-                        if (match !== null) {
-                            flightObject.aircraftIcao = match[0].slice(1);
-                        }
-                    }
-                    flightObject.operatingAirline = segment.opAirline.name
-                    flightObject.priceAdult = (dptTravellerPrices.ADT === undefined) ? 0 : dptTravellerPrices.ADT;
-                    flightObject.priceChild = (dptTravellerPrices.CHD === undefined) ? 0 : dptTravellerPrices.CHD;
-                    flightObject.priceInfant = (dptTravellerPrices.INF === undefined) ? 0 : dptTravellerPrices.INF;
-                } else {
-                    flightObject.type = 'transit'
-                    flightObject.transitFlightCode = segment.airline.code + segment.flightNumber;
-                    flightObject.transitDepartTerminal = dptTransitDepartTerminal
-                    flightObject.transitArrivalTerminal = dptTransitArrivalTerminal
-                    flightObject.departTerminal = dptDepartTerminal;
-                    flightObject.arrivalTerminal = dptArrivalTerminal;
-                    flightObject.transitAirport = segment.beginLocation.locationCode;
-                    flightObject.departDateTime = dptDepartDateTime;
-                    flightObject.arrivalDateTime = dptArrivalDateTime
-                    flightObject.transitDepartDateTime = dptTransitDepartDateTime
-                    flightObject.transitArrivalDateTime = dptTransitArrivalDateTime
-                    flightObject.transitOperatingAirline = segment.opAirline.name
-                }
-            });
-        }
+async function createSearchForm(req) {
+  const body = req.body;
+  const dptDate = common.formatDate(body.dptDate, "YYYY-MM-DD", "YYYYMMDD0000");
+  let config = {
+    method: "get",
+    maxBodyLength: Infinity,
+    url: `https://fo-asia.ttinteractive.com/Zenith/FrontOffice/usbangla/en-GB/BookingEngine/SearchResult?OriginAirportCode=${body.origin}&DestinationAirportCode=${body.dest}&OutboundDate=${body.dptDate}&InboundDate=${body.rtnDate}&TravelerTypes%5B0%5D.Key=AD&TravelerTypes%5B0%5D.Value=${body.adult}&TravelerTypes%5B1%5D.Key=CHD&TravelerTypes%5B1%5D.Value=${body.child}&TravelerTypes%5B2%5D.Key=INF&TravelerTypes%5B2%5D.Value=${body.infant}&Currency=USD`,
+    headers: {
+      Host: "fo-asia.ttinteractive.com",
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/116.0",
+      Accept: "application/json, text/plain, */*",
+      "Accept-Language": "en-US,en;q=0.5",
+      Origin: "https://usbair.com",
+      Referer: "https://usbair.com/",
+      "Sec-Fetch-Dest": "empty",
+      "Sec-Fetch-Mode": "cors",
+      "Sec-Fetch-Site": "cross-site",
+    },
+  };
+  const searchResponse = await common.fetchData(config);
+  const currentURL = searchResponse.request._redirectable._currentUrl;
+  const htmlString = searchResponse.data;
+  let navId = searchResponse.headers.get("set-cookie")[0];
+  let prodAsia = searchResponse.headers.get("set-cookie")[5];
+  const startIndex2 = prodAsia.indexOf("path");
+  if (startIndex2 !== -1) {
+    prodAsia = prodAsia.substring(0, startIndex2 - 1);
+  }
 
-        if (!dptMap.has('' + flightObject._flightCode + flightObject._transitFlightCode)) {
-            dpt.push(flightObject.toJson())
-            dptMap.set('' + flightObject._flightCode + flightObject._transitFlightCode)
-        }
-    }
-    for (flightIndex in rtnFlights) {
-        const flightObject = new Flight();
-        const recomendList = recommendationList.filter(recommendation => recommendation.bounds[1].flightGroupList.find(flight => flight.flightId === rtnFlights[flightIndex].proposedBoundId))
-        const recomend = recomendList.reduce((smallestObj, currentObj) => {
-            if (!smallestObj || currentObj.bounds[1].travellerPrices.ADT < smallestObj.bounds[1].travellerPrices.ADT) {
-              return currentObj;
-            }
-            return smallestObj;
-          }, null);
-        const rtnSegments = rtnFlights[flightIndex].segments;
-        if(rtnSegments.length>2) continue;
-        if(recomend === undefined || recomend === null){
-            continue;
-        }
-        const flight = recomend.bounds[1].flightGroupList.find(flight => flight.flightId === rtnFlights[flightIndex].proposedBoundId);
-        if(flight === undefined || flight ===null) continue;
-        const fareFamily= availability.fareFamilyList.find(fare => fare.ffCode === recomend.ffCode)
-        // logger.info(bookingClass)
-        const rtnTravellerPrices = {
-            ADT: recomend.bounds[1].travellerPrices.ADT,
-            CHD: recomend.bounds[1].travellerPrices.CHD,
-            INF: recomend.bounds[1].travellerPrices.INF
-        }
-        let rtnDepartDateTime = null;
-            let rtnArrivalDateTime = null;
-            let rtnTransitDepartDateTime = null;
-            let rtnTransitArrivalDateTime = null;
-            let rtnDepartTerminal = null;
-            let rtnArrivalTerminal = null;
-            let rtnTransitDepartTerminal = null;
-            let rtnTransitArrivalTerminal = null;
-        if (rtnSegments.length == 2) {
-            rtnDepartDateTime = common.formatFlightDate(rtnSegments[0].beginDate);
-            rtnArrivalDateTime = common.formatFlightDate(rtnSegments[1].endDate);
-            rtnTransitDepartDateTime = common.formatFlightDate(rtnSegments[1].beginDate);
-            rtnTransitArrivalDateTime = common.formatFlightDate(rtnSegments[0].endDate);
-            rtnDepartTerminal = rtnSegments[0].beginTerminal;
-            rtnArrivalTerminal = rtnSegments[1].endTerminal;
-            rtnTransitDepartTerminal = rtnSegments[1].beginTerminal;
-            rtnTransitArrivalTerminal = rtnSegments[0].endTerminal;
-        }
-        if (rtnSegments.length < 2) {
-            segment = rtnSegments[0];
-            flightObject.flightCode = segment.airline.code + segment.flightNumber;
-            flightObject.type = 'direct'
-            flightObject.departTerminal = segment.beginTerminal;
-            flightObject.departDateTime = common.formatFlightDate(segment.beginDate);
-            flightObject.arrivalTerminal = segment.endTerminal;
-            flightObject.arrivalDateTime = common.formatFlightDate(segment.endDate);
-            flightObject.cabinClass = fareFamily.ffName.replace('<br>', ' ');
-            flightObject.bookingClass = flight.rbd;
-            flightObject.class = flight.rbd;
-            flightObject.currency = availability.currencyBean.code;
-            flightObject.aircraftName = segment.equipment.name;
-            flightObject.aircraftIata = segment.equipment.code;
-            let match = segment.equipment.name.match(/ [^]*-/g)
-            if (match !== null) {
-                flightObject.aircraftIcao = match[0].slice(1, -1);
-            } else {
-                match = segment.equipment.name.match(/ [^]*/g);
-                if (match !== null) {
-                    flightObject.aircraftIcao = match[0].slice(1);
-                }
-            }
-            flightObject.operatingAirline = segment.opAirline.name
-            flightObject.priceAdult = (rtnTravellerPrices.ADT === undefined) ? 0 : rtnTravellerPrices.ADT;
-            flightObject.priceChild = (rtnTravellerPrices.CHD === undefined) ? 0 : rtnTravellerPrices.CHD;
-            flightObject.priceInfant = (rtnTravellerPrices.INF === undefined) ? 0 : rtnTravellerPrices.INF;
-        }else{
-            rtnSegments.forEach(segment => {
-                if (segment.endLocation.locationCode !== req.body.origin) {
-                    flightObject.flightCode = segment.airline.code + segment.flightNumber;
-                    flightObject.type = 'direct'
-                    flightObject.departTerminal = segment.beginTerminal;
-                    flightObject.departDateTime = common.formatFlightDate(segment.beginDate);
-                    flightObject.arrivalTerminal = segment.endTerminal;
-                    flightObject.arrivalDateTime = common.formatFlightDate(segment.endDate);
-                    flightObject.cabinClass = fareFamily.ffName.replace('<br>', ' ');
-                    flightObject.bookingClass = flight.rbd;
-                    flightObject.class = flight.rbd;
-                    flightObject.currency = availability.currencyBean.code;
-                    flightObject.aircraftName = segment.equipment.name;
-                    flightObject.aircraftIata = segment.equipment.code;
-                    let match = segment.equipment.name.match(/ [^]*-/g)
-                    if (match !== null) {
-                        flightObject.aircraftIcao = match[0].slice(1, -1);
-                    } else {
-                        match = segment.equipment.name.match(/ [^]*/g);
-                        if (match !== null) {
-                            flightObject.aircraftIcao = match[0].slice(1);
-                        }
-                    }
-                    flightObject.operatingAirline = segment.opAirline.name
-                    flightObject.priceAdult = (rtnTravellerPrices.ADT === undefined) ? 0 : rtnTravellerPrices.ADT;
-                    flightObject.priceChild = (rtnTravellerPrices.CHD === undefined) ? 0 : rtnTravellerPrices.CHD;
-                    flightObject.priceInfant = (rtnTravellerPrices.INF === undefined) ? 0 : rtnTravellerPrices.INF;
-                } else {
-                    flightObject.type = 'transit'
-                    flightObject.transitFlightCode = segment.airline.code + segment.flightNumber;
-                    flightObject.transitDepartTerminal = rtnTransitDepartTerminal
-                    flightObject.transitArrivalTerminal = rtnTransitArrivalTerminal
-                    flightObject.departTerminal = rtnDepartTerminal;
-                    flightObject.arrivalTerminal = rtnArrivalTerminal;
-                    flightObject.transitAirport = segment.beginLocation.locationCode;
-                    flightObject.departDateTime = rtnDepartDateTime;
-                    flightObject.arrivalDateTime = rtnArrivalDateTime
-                    flightObject.transitDepartDateTime = rtnTransitDepartDateTime
-                    flightObject.transitArrivalDateTime = rtnTransitArrivalDateTime
-                    flightObject.transitOperatingAirline = segment.opAirline.name
-                }
-            });
-        }
-        if (!rtnMap.has('' + flightObject._flightCode + flightObject._transitFlightCode)) {
-            rtn.push(flightObject.toJson())
-            rtnMap.set('' + flightObject._flightCode + flightObject._transitFlightCode)
-        }
-    }
-    const responseFlight = {
-        "dpt": dpt,
-        "rtn": rtn
+  const startIndex = navId.indexOf("path");
+  if (startIndex !== -1) {
+    navId = navId.substring(0, startIndex - 1);
+  }
+  let __RequestVerificationToken = searchResponse.headers.get("set-cookie")[2];
+  const startIndex1 = __RequestVerificationToken.indexOf("path");
+  if (startIndex1 !== -1) {
+    __RequestVerificationToken = __RequestVerificationToken.substring(
+      0,
+      startIndex1 - 1
+    );
+  }
+  const regex =
+    /\/Zenith\/FrontOffice\/\(S\([^]{32}\)\)\/usbangla\/en-GB\/FlexibleFlightStaticAjax\/FlexibleFLightListLoadSelectionResume\?__cnv=[^]{5}/;
+  const linkRequest =
+    "https://fo-asia.ttinteractive.com/" +
+    htmlString.match(regex).map((match) => match.slice(1))[0];
+  // Load the HTML content into Cheerio
+  const $ = cheerio.load(htmlString);
+  const inputTag = $('input[name="__RequestVerificationToken"][type="hidden"]');
+  const viewModelContent = htmlString.match(/var viewModel = (\{.*\});/)[1];
+  const headerRequestVerificationToken = inputTag.attr("value");
+  const regex1 =
+    /\/Zenith\/FrontOffice\/\(S\([^]{32}\)\)\/usbangla\/en-GB\/FlexibleFlightStaticAjax\/FlexibleFlightListLoadSelectedDays\?__cnv=[^]{5}/;
+  const linkRequest1 =
+    "https://fo-asia.ttinteractive.com/" +
+    htmlString.match(regex1).map((match) => match.slice(1))[0];
+  const parsedUrl = new URL(linkRequest1);
+  const regesx = /\(S\(([^)]+)\)\)/;
+  const match = linkRequest1.match(regesx);
+  const extractedValue = match ? match[1] : null;
+  const cnvValue = parsedUrl.searchParams.get("__cnv");
+  const cookie = prodAsia.concat(__RequestVerificationToken).concat(navId);
+  const parseViewModleContent = JSON.parse(viewModelContent);
+
+  let traveler1 = null;
+  let traveler2 = null;
+  if (parseViewModleContent.Travelers[1] != undefined) {
+    traveler1 = `&Travelers%5B1%5D%5BDataId%5D=${parseViewModleContent.Travelers[1].DataId}&Travelers%5B1%5D%5BCount%5D=${parseViewModleContent.Travelers[1].Count}`;
+  }
+  if (parseViewModleContent.Travelers[2] != undefined) {
+    traveler2 = `&Travelers%5B2%5D%5BDataId%5D=${parseViewModleContent.Travelers[2].DataId}&Travelers%5B2%5D%5BCount%5D=${parseViewModleContent.Travelers[2].Count}`;
+  }
+  let data = `SaleConditionAccepted=${
+    parseViewModleContent.SaleConditionAccepted
+  }&RGPDConditionAccepted=${
+    parseViewModleContent.RGPDConditionAccepted
+  }&ExtendedSearchDayCount=${
+    parseViewModleContent.ExtendedSearchDayCount
+  }&DoNotCheckCache=${parseViewModleContent.DoNotCheckCache}&AlreadyLoggedIn=${
+    parseViewModleContent.AlreadyLoggedIn
+  }&TempDataGuid=${parseViewModleContent.TempDataGuid}&CurrencyCode=${
+    parseViewModleContent.CurrencyCode
+  }&FareBasisDataId=&SelectedTimeLimitExtensionDataId=&IsFirstRequest=false&Travelers%5B0%5D%5BDataId%5D=${
+    parseViewModleContent.Travelers[0].DataId
+  }&Travelers%5B0%5D%5BCount%5D=${
+    parseViewModleContent.Travelers[0].Count
+  }&UserSelections%5B0%5D%5BSelectedDate%5D=${parseViewModleContent.UserSelections[0].SelectedDate.replace(
+    "T00:00:00",
+    "T00"
+  )}%3A00%3A00&UserSelections%5B0%5D%5BIsOpen%5D=${
+    parseViewModleContent.UserSelections[0].IsOpen
+  }&UserSelections%5B0%5D%5BReferenceDate%5D=${parseViewModleContent.UserSelections[0].SelectedDate.replace(
+    "T00:00:00",
+    "T00"
+  )}%3A00%3A00&UserSelections%5B0%5D%5BDataIdOrigin%5D=${
+    parseViewModleContent.UserSelections[0].DataIdOrigin
+  }&UserSelections%5B0%5D%5BDataIdDestination%5D=${
+    parseViewModleContent.UserSelections[0].DataIdDestination
+  }&UserSelections%5B0%5D%5BGenericClassDataId%5D=${
+    parseViewModleContent.UserSelections[0].GenericClassDataId != null
+      ? parseViewModleContent.UserSelections[0].GenericClassDataId
+      : ""
+  }&UserSelections%5B0%5D%5BSelectedSegments%5D=&UserSelections%5B0%5D%5BIsSearchDisabled%5D=false&UserSelections%5B0%5D%5BIsUpgrade%5D=false&UserSelections%5B0%5D%5BFlightNumbers%5D=&JsonPrepareBookingRequest=&CabinClassDataId=&IsFFPRewardSearch=false&IsTCSearch=false&TCBookCode=&PromoCode=&IsNewBooking=true&ShowingWLWarningMessageActivated=false&CustomerAccountInfo=&UpgradeType=&SearchType=&SearchUpgradeOnOtherFlight=false&ZietSearchType=0`;
+  if (traveler1 != null) {
+    data = data.concat(traveler1);
+  }
+  if (traveler2 != null) {
+    data = data.concat(traveler2);
+  }
+  let data2 = `&UserSelections%5B1%5D%5BSelectedDate%5D=${parseViewModleContent.UserSelections[1].SelectedDate.replace(
+    "T00:00:00",
+    "T00"
+  )}%3A00%3A00&UserSelections%5B1%5D%5BIsOpen%5D=false&UserSelections%5B1%5D%5BReferenceDate%5D=${parseViewModleContent.UserSelections[1].SelectedDate.replace(
+    "T00:00:00",
+    "T00"
+  )}%3A00%3A00&UserSelections%5B1%5D%5BDataIdOrigin%5D=${parseViewModleContent.UserSelections[1].DataIdOrigin}&UserSelections%5B1%5D%5BDataIdDestination%5D=${
+    parseViewModleContent.UserSelections[1].DataIdDestination
+  }&UserSelections%5B1%5D%5BGenericClassDataId%5D=&UserSelections%5B1%5D%5BSelectedSegments%5D=&UserSelections%5B1%5D%5BIsSearchDisabled%5D=false&UserSelections%5B1%5D%5BIsUpgrade%5D=false&UserSelections%5B1%5D%5BFlightNumbers%5D=`;
+  data = data.concat(data2);
+  const reffert = `https://fo-asia.ttinteractive.com/Zenith/FrontOffice/(S(${extractedValue}))/usbangla/en-GB/BookingEngine/SearchResult?OriginAirportCode=${body.origin}&DestinationAirportCode=${body.dest}&OutboundDate=${body.dptDate}&InboundDate=${body.rtnDate}&TravelerTypes%5B0%5D.Key=AD&TravelerTypes%5B0%5D.Value=${body.adult}&TravelerTypes%5B1%5D.Key=CHD&TravelerTypes%5B1%5D.Value=${body.child}&TravelerTypes%5B2%5D.Key=INF&TravelerTypes%5B2%5D.Value=${body.infant}&Currency=USD`;
+  let config1 = {
+    method: "post",
+    maxBodyLength: Infinity,
+    url: linkRequest1,
+    headers: {
+      Host: "fo-asia.ttinteractive.com",
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/116.0",
+      Accept: "text/html, */*; q=0.01",
+      "Accept-Language": "en-US,en;q=0.5",
+      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      __RequestVerificationToken: headerRequestVerificationToken,
+      "X-Requested-With": "XMLHttpRequest",
+      Origin: "https://fo-asia.ttinteractive.com",
+      Referer: reffert,
+      Cookie: cookie,
+      "Sec-Fetch-Dest": "empty",
+      "Sec-Fetch-Mode": "cors",
+      "Sec-Fetch-Site": "same-origin",
+    },
+    data: data,
+  };
+  const searchResponse1 = await common.fetchData(config1);
+  const $$ = cheerio.load(searchResponse1.data);
+  const isShowOut = $$(".Resultats.day-details .label.label-default")
+    .text()
+    .trim();
+  if (isShowOut == "Sold out") {
+    return Response.SOLD_OUT;
+  }
+  const fareButton = $$("#Fare");
+  const selectfareValue = fareButton.attr("data-selectfare");
+  const moddalBody = $$(".row.day-detail-trip-row");
+  let lstUser = new Array();
+  let searchJson = new Array();
+  moddalBody.each((index, element) => {
+    let user = {
+      flightNumber: null,
+      fromDate: null,
+      toDate: null,
+      type: null,
     };
-    return responseFlight;
+    const type = $(element)
+      .find(".col-xs-5.text-center div:last-child")
+      .text()
+      .trim();
+    const regexDate = /[a-zA-Z]{3} [\d]{2} [a-zA-Z]{3} [\d]{2}:[\d]{2}/g;
+    const dataArray = type.match(regexDate);
+    const dateObjects = dataArray.map((dateString) => dateFormat(dateString));
+    const flight = $(element)
+      .find(".col-xs-8.text-center span")
+      .text()
+      .trim()
+      .replace(
+        "\n                                    \n                                        ",
+        ""
+      );
+    user.flightNumber = flight;
+    user.fromDate = dateObjects[0];
+    user.toDate = dateObjects[1];
+    $(element).find(".row.day-details-generic-classes-block");
+    const genericClass = $(element).find(
+      ".row.day-details-generic-classes-block"
+    );
+    const columnCabin = $(genericClass).find(
+      ".text-center.day-details-cell.display-inline.tarif.col-lg-3.col-md-3.col-sm-3.col-xs-12"
+    );
+    const availableIndex = $(columnCabin)
+      .find(".btn-group-vertical.day-details-amount-block")
+      .first();
+    const btnFare = $(availableIndex).find("#Fare").attr("data-selectfare");
+    const decodedString = he.decode(btnFare);
+    const parsedJson = JSON.parse(decodedString);
+    const typeCount = $(genericClass).find(
+      "div.day-details-cell button.btn.btn-default[disabled]"
+    ).length;
+    user.type = typeCount;
+    searchJson.push(parsedJson);
+    lstUser.push(user);
+  });
+  const parse = JSON.parse(selectfareValue);
+  const flightNumbers1 =
+    parse.UserSelections[0].SelectedSegments[0].FlightNumber;
+  const dataIdFlight = parse.UserSelections[0].SelectedSegments[0].DataIdFlight;
+  const airlineDesignator =
+    parse.UserSelections[0].SelectedSegments[0].airlineDesignator;
+  const departureDateTime =
+    parse.UserSelections[0].SelectedSegments[0].DepartureDateTime;
+  const dpt = new Array();
+  const rtn = new Array();
+  await Promise.all(
+    searchJson.map(async (number) => {
+      const flightReponse = await searchResult(
+        req,
+        viewModelContent,
+        currentURL,
+        linkRequest,
+        navId,
+        prodAsia,
+        __RequestVerificationToken,
+        headerRequestVerificationToken,
+        flightNumbers1,
+        dataIdFlight,
+        airlineDesignator,
+        departureDateTime,
+        parse,
+        number,
+        searchJson[0]
+      );
+      if (flightReponse.isReturnFlight) {
+        rtn.push(flightReponse.flightObject);
+      } else {
+        dpt.push(flightReponse.flightObject);
+      }
+    })
+  );
+ 
+  
+  return {
+    dpt: dpt,
+    rtn: rtn,
+  };
+}
+function dateFormat(inputDate) {
+  const date = new Date(inputDate);
+  const currentDate = new Date();
+  const addLeadingZero = (number) => (number < 10 ? "0" : "") + number;
+  const formattedDate = `${currentDate.getFullYear()}-${addLeadingZero(
+    date.getMonth() + 1
+  )}-${addLeadingZero(date.getDate())} ${addLeadingZero(
+    date.getHours()
+  )}:${addLeadingZero(date.getMinutes())}:00`;
+  return formattedDate;
+}
+function formatDate(inputDate) {
+  const months = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+  ];
+
+  const [, day, monthName, time] = inputDate.match(/(\d+) (\w+) (\d{2}:\d{2})/);
+
+  const monthIndex =
+    months.findIndex(
+      (month) => month.toLowerCase() === monthName.toLowerCase()
+    ) + 1;
+  const month = monthIndex < 10 ? `0${monthIndex}` : monthIndex;
+  const year = new Date().getFullYear();
+
+  const formattedDate = `${year}-${month}-${day} ${time}:00`;
+  return formattedDate;
+}
+async function searchResult(
+  req,
+  viewModelContent,
+  currentURL,
+  linkRequest,
+  navId,
+  prodAsia,
+  __RequestVerificationToken,
+  headerRequestVerificationToken,
+  flightNumbers1,
+  dataIdFlight,
+  airlineDesignator,
+  departureDateTime,
+  parse,
+  parsedJson,
+  parsedJsonFirst
+) {
+  const cookie = prodAsia.concat(__RequestVerificationToken).concat(navId);
+  let dataBUP = null;
+  let isReturnFlight = false;
+  // &Travelers%5B1%5D%5BDataId%5D=2&Travelers%5B1%5D%5BCount%5D=1
+  // &Travelers%5B2%5D%5BDataId%5D=3&Travelers%5B2%5D%5BCount%5D=1
+  let traveler1 = null;
+  let traveler2 = null;
+  if (parse.Travelers[1] != undefined) {
+    traveler1 = `&Travelers%5B1%5D%5BDataId%5D=${parse.Travelers[1].DataId}&Travelers%5B1%5D%5BCount%5D=${parse.Travelers[1].Count}`;
+  }
+  if (parse.Travelers[2] != undefined) {
+    traveler2 = `&Travelers%5B2%5D%5BDataId%5D=${parse.Travelers[2].DataId}&Travelers%5B2%5D%5BCount%5D=${parse.Travelers[2].Count}`;
+  }
+  const index =
+    parsedJson.UserSelections[0].SelectedSegments[0] != null ? 0 : 1;
+  let data = `SaleConditionAccepted=${
+    parse.SaleConditionAccepted
+  }&RGPDConditionAccepted=${
+    parse.RGPDConditionAccepted
+  }&ExtendedSearchDayCount=${parse.ExtendedSearchDayCount}&DoNotCheckCache=${
+    parse.DoNotCheckCache
+  }&AlreadyLoggedIn=${parse.AlreadyLoggedIn}&TempDataGuid=${
+    parse.TempDataGuid
+  }&CurrencyCode=${
+    parse.CurrencyCode
+  }&FareBasisDataId=&SelectedTimeLimitExtensionDataId=&IsFirstRequest=${
+    parse.IsFirstRequest
+  }&Travelers%5B0%5D%5BDataId%5D=${
+    parse.Travelers[0].DataId
+  }&Travelers%5B0%5D%5BCount%5D=${
+    parse.Travelers[0].Count
+  }&UserSelections%5B0%5D%5BSelectedDate%5D=${parse.UserSelections[
+    index
+  ].SelectedDate.replace(
+    "T00:00:00",
+    "T00"
+  )}%3A00%3A00&UserSelections%5B0%5D%5BIsOpen%5D=${
+    parse.UserSelections[index].IsOpen
+  }&UserSelections%5B0%5D%5BReferenceDate%5D=${parse.UserSelections[
+    index
+  ].ReferenceDate.replace(
+    "T00:00:00",
+    "T00"
+  )}%3A00%3A00&UserSelections%5B0%5D%5BDataIdOrigin%5D=${
+    parse.UserSelections[index].DataIdOrigin
+  }&UserSelections%5B0%5D%5BDataIdDestination%5D=${
+    parse.UserSelections[index].DataIdDestination
+  }&UserSelections%5B0%5D%5BGenericClassDataId%5D=${
+    parsedJson.UserSelections[index].GenericClassDataId
+  }&UserSelections%5B0%5D%5BSelectedSegments%5D%5B0%5D%5BDataIdOrigin%5D=${
+    parse.UserSelections[index].DataIdOrigin
+  }&UserSelections%5B0%5D%5BSelectedSegments%5D%5B0%5D%5BDataIdDestination%5D=${
+    parse.UserSelections[index].DataIdDestination
+  }
+    &UserSelections%5B0%5D%5BIsSearchDisabled%5D=false&UserSelections%5B0%5D%5BIsUpgrade%5D=false&UserSelections%5B0%5D%5BFlightNumbers%5D=&JsonPrepareBookingRequest=&CabinClassDataId=&IsFFPRewardSearch=false&IsTCSearch=false&TCBookCode=&PromoCode=&IsNewBooking=true&ShowingWLWarningMessageActivated=false&CustomerAccountInfo=&UpgradeType=&SearchType=&SearchUpgradeOnOtherFlight=false&ZietSearchType=0`;
+
+  if (traveler1 != null) {
+    data = data.concat(traveler1);
+  }
+  if (traveler2 != null) {
+    data = data.concat(traveler2);
+  }
+  let data2 = `&UserSelections%5B1%5D%5BSelectedDate%5D=${parse.UserSelections[1].SelectedDate.replace(
+    "T00:00:00",
+    "T00"
+  )}%3A00%3A00&UserSelections%5B1%5D%5BIsOpen%5D=false&UserSelections%5B1%5D%5BReferenceDate%5D=${parse.UserSelections[1].SelectedDate.replace(
+    "T00:00:00",
+    "T00"
+  )}%3A00%3A00&UserSelections%5B1%5D%5BDataIdOrigin%5D=${parsedJson.UserSelections[1].DataIdOrigin}&UserSelections%5B1%5D%5BDataIdDestination%5D=${
+    parse.UserSelections[1].DataIdDestination
+  }&UserSelections%5B1%5D%5BGenericClassDataId%5D=&UserSelections%5B1%5D%5BSelectedSegments%5D=&UserSelections%5B1%5D%5BIsSearchDisabled%5D=false&UserSelections%5B1%5D%5BIsUpgrade%5D=false&UserSelections%5B1%5D%5BFlightNumbers%5D=`;
+  data = data.concat(data2);
+  if (parsedJson.UserSelections[0].SelectedSegments[0] != null) {
+    let datas = `&UserSelections%5B0%5D%5BSelectedSegments%5D%5B0%5D%5BAirlineDesignator%5D=${
+      parsedJson.UserSelections[index].SelectedSegments[index].AirlineDesignator
+    }&UserSelections%5B0%5D%5BSelectedSegments%5D%5B0%5D%5BFlightNumber%5D=${
+      parsedJson.UserSelections[index].SelectedSegments[index].FlightNumber
+    }&UserSelections%5B0%5D%5BSelectedSegments%5D%5B0%5D%5BDepartureDateTime%5D=${parsedJson.UserSelections[
+      index
+    ].SelectedSegments[index].DepartureDateTime.replace(
+      "T00:00:00",
+      "T00"
+    )}%3A00%3A00&UserSelections%5B0%5D%5BSelectedSegments%5D%5B0%5D%5BDataIdFlight%5D=${
+      parsedJson.UserSelections[index].SelectedSegments[index].DataIdFlight
+    }`;
+    data = data.concat(datas);
+  } else {
+    let datas = `&UserSelections%5B0%5D%5BSelectedSegments%5D%5B0%5D%5BAirlineDesignator%5D=${
+      parsedJson.UserSelections[index].SelectedSegments[0].AirlineDesignator
+    }&UserSelections%5B0%5D%5BSelectedSegments%5D%5B0%5D%5BFlightNumber%5D=${
+      parsedJson.UserSelections[index].SelectedSegments[0].FlightNumber
+    }&UserSelections%5B0%5D%5BSelectedSegments%5D%5B0%5D%5BDepartureDateTime%5D=${parsedJson.UserSelections[
+      index
+    ].SelectedSegments[0].DepartureDateTime.replace(
+      "T00:00:00",
+      "T00"
+    )}%3A00%3A00&UserSelections%5B0%5D%5BSelectedSegments%5D%5B0%5D%5BDataIdFlight%5D=${
+      parsedJson.UserSelections[index].SelectedSegments[0].DataIdFlight
+    }`;
+    data = data.concat(datas);
+    let datatest = `SaleConditionAccepted=${
+      parse.SaleConditionAccepted
+    }&RGPDConditionAccepted=${
+      parse.RGPDConditionAccepted
+    }&ExtendedSearchDayCount=${parse.ExtendedSearchDayCount}&DoNotCheckCache=${
+      parse.DoNotCheckCache
+    }&AlreadyLoggedIn=${parse.AlreadyLoggedIn}&TempDataGuid=${
+      parse.TempDataGuid
+    }&CurrencyCode=${
+      parse.CurrencyCode
+    }&FareBasisDataId=&SelectedTimeLimitExtensionDataId=&IsFirstRequest=${
+      parse.IsFirstRequest
+    }&Travelers%5B0%5D%5BDataId%5D=${
+      parse.Travelers[0].DataId
+    }&Travelers%5B0%5D%5BCount%5D=${
+      parse.Travelers[0].Count
+    }&UserSelections%5B0%5D%5BSelectedDate%5D=${parse.UserSelections[0].SelectedDate.replace(
+      "T00:00:00",
+      "T00"
+    )}%3A00%3A00&UserSelections%5B0%5D%5BIsOpen%5D=${
+      parse.UserSelections[index].IsOpen
+    }&UserSelections%5B0%5D%5BReferenceDate%5D=${parse.UserSelections[0].SelectedDate.replace(
+      "T00:00:00",
+      "T00"
+    )}%3A00%3A00&UserSelections%5B0%5D%5BDataIdOrigin%5D=${
+      parse.UserSelections[0].DataIdOrigin
+    }&UserSelections%5B0%5D%5BDataIdDestination%5D=${
+      parse.UserSelections[0].DataIdDestination
+    }&UserSelections%5B0%5D%5BGenericClassDataId%5D=15&UserSelections%5B0%5D%5BSelectedSegments%5D%5B0%5D%5BDataIdOrigin%5D=${
+      parse.UserSelections[0].DataIdOrigin
+    }&UserSelections%5B0%5D%5BSelectedSegments%5D%5B0%5D%5BDataIdDestination%5D=${
+      parse.UserSelections[0].DataIdDestination
+    }&UserSelections%5B0%5D%5BSelectedSegments%5D%5B0%5D%5BAirlineDesignator%5D=${parsedJsonFirst.UserSelections[0].SelectedSegments[0].AirlineDesignator}&UserSelections%5B0%5D%5BSelectedSegments%5D%5B0%5D%5BFlightNumber%5D=${parsedJsonFirst.UserSelections[0].SelectedSegments[0].FlightNumber}&UserSelections%5B0%5D%5BSelectedSegments%5D%5B0%5D%5BDepartureDateTime%5D=${parsedJsonFirst.UserSelections[0].SelectedSegments[0].DepartureDateTime.replace(
+      "T00:00:00",
+      "T00"
+    )}%3A00%3A00&UserSelections%5B0%5D%5BSelectedSegments%5D%5B0%5D%5BDataIdFlight%5D=${parsedJsonFirst.UserSelections[0].SelectedSegments[0].DataIdFlight}&UserSelections%5B1%5D%5BSelectedDate%5D=${parsedJson.UserSelections[1].SelectedDate.replace(
+      "T00:00:00",
+      "T00"
+    )}%3A00%3A00&UserSelections%5B1%5D%5BIsOpen%5D=false&UserSelections%5B1%5D%5BReferenceDate%5D=${parsedJson.UserSelections[1].ReferenceDate.replace(
+      "T00:00:00",
+      "T00"
+    )}%3A00%3A00&UserSelections%5B1%5D%5BDataIdOrigin%5D=${parsedJson.UserSelections[1].DataIdOrigin}&UserSelections%5B1%5D%5BDataIdDestination%5D=${parsedJson.UserSelections[1].DataIdDestination}&UserSelections%5B1%5D%5BGenericClassDataId%5D=${parsedJson.UserSelections[1].GenericClassDataId}&UserSelections%5B1%5D%5BSelectedSegments%5D%5B0%5D%5BAirlineDesignator%5D=${parsedJson.UserSelections[1].SelectedSegments[0].AirlineDesignator}&UserSelections%5B1%5D%5BSelectedSegments%5D%5B0%5D%5BFlightNumber%5D=${parsedJson.UserSelections[1].SelectedSegments[0].FlightNumber}&UserSelections%5B1%5D%5BSelectedSegments%5D%5B0%5D%5BDepartureDateTime%5D=${parsedJson.UserSelections[1].SelectedSegments[0].DepartureDateTime.replace(
+      "T00:00:00",
+      "T00"
+    )}%3A00%3A00&UserSelections%5B1%5D%5BSelectedSegments%5D%5B0%5D%5BDataIdFlight%5D=${parsedJson.UserSelections[1].SelectedSegments[0].DataIdFlight}&UserSelections%5B1%5D%5BSelectedSegments%5D%5B0%5D%5BDataIdOrigin%5D=${parsedJson.UserSelections[1].SelectedSegments[0].DataIdOrigin}&UserSelections%5B1%5D%5BSelectedSegments%5D%5B0%5D%5BDataIdDestination%5D=${parsedJson.UserSelections[1].SelectedSegments[0].DataIdDestination}&UserSelections%5B1%5D%5BIsSearchDisabled%5D=false&UserSelections%5B1%5D%5BIsUpgrade%5D=false&UserSelections%5B1&UserSelections%5B0%5D%5BIsSearchDisabled%5D=false&UserSelections%5B0%5D%5BIsUpgrade%5D=false&UserSelections%5B0%5D%5BFlightNumbers%5D=&JsonPrepareBookingRequest=&CabinClassDataId=&IsFFPRewardSearch=false&IsTCSearch=false&TCBookCode=&PromoCode=&IsNewBooking=true&ShowingWLWarningMessageActivated=false&CustomerAccountInfo=&UpgradeType=&SearchType=&SearchUpgradeOnOtherFlight=false&ZietSearchType=0`;
+    datatest = datatest.concat(traveler1);
+    datatest = datatest.concat(traveler2);
+    data = datatest;
+    isReturnFlight = true;
+  }
+
+  let config = {
+    method: "post",
+    maxBodyLength: Infinity,
+    url: `${linkRequest}`,
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/116.0",
+      Accept: "text/html, */*; q=0.01",
+      "Accept-Language": "en-US,en;q=0.5",
+      "Accept-Encoding": "gzip, deflate, br",
+      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      __RequestVerificationToken: headerRequestVerificationToken,
+      "X-Requested-With": "XMLHttpRequest",
+      Origin: "https://fo-asia.ttinteractive.com",
+      Connection: "keep-alive",
+      Referer: currentURL,
+      Cookie: cookie,
+      "Sec-Fetch-Dest": "empty",
+      "Sec-Fetch-Mode": "cors",
+      "Sec-Fetch-Site": "same-origin",
+    },
+    data: data,
+  };
+  // const name = $(element).find('.sum-up-label span:last-child').text();
+  const searchResult = await common.fetchData(config);
+  const $ = cheerio.load(searchResult.data);
+  let equipmentValue = $(".plane strong")
+    .parent()
+    .text()
+    .trim()
+    .replace("Equipment: ", "");
+
+  let flightNumber = $("#flightnumber strong").text().trim();
+  let departure = $('strong:contains("Departure"):first-child')
+    .parent()
+    .text()
+    .trim()
+    .replace("Departure :\n", "");
+  let arrival = $('strong:contains("Arrival"):first-child')
+    .parent()
+    .text()
+    .trim()
+    .replace("Arrival :\n", "");
+  if (isReturnFlight) {
+    const arrivalRegExp = /Arrival :\n(\w{3}) (\d{2}) (\w+) (\d{2}:\d{2})/;
+    const arrivalMatch = arrival
+      .match(arrivalRegExp)[0]
+      .match(/[^]*/)[0]
+      .replace("Arrival :\n", "");
+    arrival = arrivalMatch;
+    const DepartureRegExp = /Departure :\n(\w{3}) (\d{2}) (\w+) (\d{2}:\d{2})/;
+    const departureMatch = departure
+      .match(DepartureRegExp)[0]
+      .match(/[^]*/)[0]
+      .replace("Departure :\n", "");
+    departure = departureMatch;
+    const equipmentRegExp = /Equipment: ([^\n]+)/;
+    const equipmentMatch = equipmentValue.match(equipmentRegExp)[1];
+    equipmentValue = equipmentMatch;
+    flightNumber = flightNumber.match(/[A-Z]{2} \d{3}/g)[1];
+  }
+  const departureDate = formatDate(departure);
+  const arrivalDate = formatDate(arrival);
+  const flightObject = new Flight();
+  const parts = equipmentValue.match(/^(.*?)\s*-\s*(\d+)/);
+  const aircraft = parts[1].trim();
+  const number = parts[2].trim();
+  flightObject.flightCode = flightNumber;
+  flightObject.type = "direct";
+  flightObject.aircraftIata = aircraft;
+  flightObject.aircraftIcao = number;
+  flightObject.aircraftName = equipmentValue;
+  flightObject.currency = "USD";
+  if (parsedJson.UserSelections[index].GenericClassDataId == "13") {
+    flightObject.cabinClass = "Economy Light";
+  } else if (parsedJson.UserSelections[index].GenericClassDataId == "15") {
+    flightObject.cabinClass = "Economy Saver";
+  } else if (parsedJson.UserSelections[index].GenericClassDataId == "18") {
+    flightObject.cabinClass = "Economy Value";
+  } else {
+    flightObject.cabinClass = "Economy Flex";
+  }
+  flightObject.departDateTime = departureDate;
+  flightObject.arrivalDateTime = arrivalDate;
+  const sumUpDivs = $(".row.total-to-pay .sum-up-pax");
+  sumUpDivs.each((index, element) => {
+    const type = $(element).find(".sum-up-label span:last-child").text();
+    const priceText = $(element).find(".sum-up-val span:first-child").text();
+    const price = parseFloat(priceText.replace(" USD", ""));
+    if (type === "Adult(s)") {
+      flightObject.priceAdult = price;
+    }
+    if (type === "Child(ren)") {
+      flightObject.priceChild = price;
+    }
+    if (type === "Infant(s)") {
+      flightObject.priceInfant = price;
+    }
+  });
+
+  return {
+    isReturnFlight: isReturnFlight,
+    flightObject: flightObject.toJson(),
+  };
 }
